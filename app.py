@@ -130,7 +130,7 @@ if uploaded_file and api_key:
     with st.spinner("🔍 جاري تحليل الملف..."):
         client = openai.OpenAI(api_key=api_key)
         doc = Document(uploaded_file)
-        new_doc = Document()
+        new_doc = Document(uploaded_file)
         all_entities = []
 
         for para in doc.paragraphs:
