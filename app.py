@@ -112,8 +112,7 @@ def rewrite_paragraph_with_styles(paragraph, entities):
 # --- المعالجة ---
 if uploaded_file and api_key:
     with st.spinner("🔍 جاري تحليل الملف..."):
-        client = openai.OpenAI(api_key="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")
-        # client = openai.OpenAI(api_key=api_key)
+        client = openai.OpenAI(api_key=api_key)
         doc = Document(uploaded_file)
         new_doc = Document()
         all_entities = []
