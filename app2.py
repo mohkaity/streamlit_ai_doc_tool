@@ -1,1 +1,178 @@
+import streamlit as st
+import openai
+import pandas as pd
+from docx import Document
+from docx.shared import RGBColor
+import io
+import json
+import re
+import time
+import os
 
+# --- إعداد الواجهة ---
+st.set_page_config(page_title="استخراج الكيانات من مستند Word", layout="centered")
+st.title("📄 أداة استخراج الكيانات (NER)")
+
+# --- إدخال البيانات ---
+st.sidebar.header("إعدادات النموذج")
+api_key = st.sidebar.text_input("🔑 أدخل مفتاح OpenAI API", type="password")
+model = st.sidebar.selectbox("🤖 اختر النموذج", ["gpt-3.5-turbo", "gpt-4"])
+
+uploaded_file = st.file_uploader("📤 ارفع ملف Word (بصيغة .docx)", type=["docx"])
+
+# --- إعداد جلسة التخزين ---
+if "docx_data" not in st.session_state:
+    st.session_state.docx_data = None
+if "excel_data" not in st.session_state:
+    st.session_state.excel_data = None
+
+# --- إعداد الأنماط ---
+style_map = {
+    "الأماكن": {"style": "أماكن", "color": RGBColor(255, 0, 0)},
+    "الأعلام": {"style": "أعلام", "color": RGBColor(0, 0, 255)},
+    "الفرق": {"style": "فرق", "color": RGBColor(0, 128, 0)},
+    "الكتب": {"style": "كتب", "color": RGBColor(128, 0, 128)},
+    "الشواهد": {"style": "شواهد", "color": RGBColor(255, 165, 0)},
+}
+
+# --- دالة استخراج الكيانات ---
+def extract_entities(client, model, paragraph_text):
+    prompt = f"""
+ أنت خبير لغوي مكلف بتحليل النص التالي واستخراج الكيانات التالية بدقة:
+
+           1. الأماكن (المدن، الدول، المناطق)
+              - ❌ لا تدرج أسماء منسوبة (مثل: البغداديين)
+              - ✅ أدرج فقط الاسم الأصلي مثل: "بغداد"، "مكة"
+              بمعنى أنك لو وجدت كلمة تعني نسبة شخص لمنطقة فلا تعتبرها مكاناً مثلا البغدادي لا يعني بغداد
+              فقط ضع اعتبار للمكان المجرد وأعتبره من الأماكن سواء كان مباشراً مثل يمن أو معرفاً مثل اليمن لكن لو كان نسبة مثل اليمني فلا تضفه
+
+           2. الأعلام (أسماء أشخاص حقيقيين فقط)
+              - ❌ لا تدرج ألقاب جماعية أو صفات نسبية مثل: "الشافعية"، "الحنابلة"
+- لا تعتبر "النبي" أنه كيان ولا الملائكة مثل "جبريل" هذه لا تعتبر أعلام
+              - ✅ فقط الأسماء الصريحة مثل: "ابن تيمية"، "أبو حامد الغزالي"
+
+           3. الفرق والمذاهب (الكيانات الدينية والفكرية المعروفة)
+              - ✅ مثل: "المرجئة"، "الأشاعرة"، "المعتزلة"
+
+           4. أسماء الكتب (عناوين كتب علمية أو شرعية)
+              - ✅ مثل: "صحيح البخاري"، "الإحياء"، "الرد على المنطقيين"
+
+           5. الشواهد (آيات أو أحاديث فقط)
+              - ✅ كل ما يبدأ بـ "قال الله تعالى" أو "قال رسول الله"
+
+           ❗ المطلوب: استخراج الكيانات بدقة وتجاهل أي كلمات غير مطابقة للمعايير السابقة.
+
+           النص:
+{paragraph_text}
+
+الرجاء الرد بصيغة JSON فقط كما يلي:
+{{
+  "الأماكن": [],
+  "الأعلام": [],
+  "الفرق": [],
+  "الكتب": [],
+  "الشواهد": []
+}}
+"""
+    response = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+    )
+    raw_content = response.choices[0].message.content
+    cleaned = raw_content.replace("،", ",").replace("“", '"').replace("”", '"')
+    match = re.search(r'\{[\s\S]*\}', cleaned)
+    if match:
+        return json.loads(match.group())
+    else:
+        return {}
+
+# --- تنسيق الكيانات ---
+def rewrite_paragraph_with_styles(doc, text, entities):
+    new_paragraph = doc.add_paragraph()
+    new_runs = []
+    pointer = 0
+    matches = []
+
+    for entity_type, values in entities.items():
+        for val in values:
+            start = text.find(val, pointer)
+            if start != -1:
+                matches.append((start, start + len(val), val, entity_type))
+
+    matches.sort()
+    for start, end, val, etype in matches:
+        if start > pointer:
+            new_runs.append(("plain", text[pointer:start]))
+        new_runs.append((etype, val))
+        pointer = end
+    if pointer < len(text):
+        new_runs.append(("plain", text[pointer:]))
+
+    for style_type, content in new_runs:
+        run = new_paragraph.add_run(content)
+        if style_type != "plain":
+            run.style = style_map[style_type]["style"]
+            run.font.color.rgb = style_map[style_type]["color"]
+
+# --- المعالجة ---
+if uploaded_file and api_key:
+    if not st.session_state.docx_data:
+        with st.spinner("🔍 جاري تحليل الملف..."):
+            client = openai.OpenAI(api_key=api_key)
+            input_doc = Document(uploaded_file)
+            template_path = "template.docx"
+
+            if not os.path.exists(template_path):
+                st.error("❌ ملف القالب template.docx غير موجود. الرجاء إضافته إلى مجلد المشروع.")
+            else:
+                new_doc = Document(template_path)
+                all_entities = []
+
+                for para in input_doc.paragraphs:
+                    text = para.text.strip()
+                    if not text:
+                        continue
+
+                    entities = extract_entities(client, model, text)
+                    if entities:
+                        rewrite_paragraph_with_styles(new_doc, text, entities)
+                        for etype, vals in entities.items():
+                            for v in vals:
+                                all_entities.append({"الكيان": v, "النوع": etype, "الفقرة": text})
+
+                    time.sleep(1.5)
+
+                # حفظ النتائج في الذاكرة
+                word_io = io.BytesIO()
+                new_doc.save(word_io)
+                word_io.seek(0)
+                st.session_state.docx_data = word_io
+
+                excel_io = io.BytesIO()
+                df = pd.DataFrame(all_entities)
+                df.to_excel(excel_io, index=False)
+                excel_io.seek(0)
+                st.session_state.excel_data = excel_io
+
+                st.success("✅ تم التحليل بنجاح")
+
+# --- أزرار التنزيل ---
+if st.session_state.docx_data:
+    st.download_button(
+        label="📥 تحميل ملف Word الناتج",
+        data=st.session_state.docx_data,
+        file_name="نتيجة.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    )
+
+if st.session_state.excel_data:
+    st.download_button(
+        label="📊 تحميل ملف Excel للكيانات",
+        data=st.session_state.excel_data,
+        file_name="الكيانات.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+elif uploaded_file and not api_key:
+    st.warning("⚠️ الرجاء إدخال مفتاح API للمتابعة.")
